@@ -1,56 +1,24 @@
 
-import os
-import boto3
-import pymupdf4llm
-
 from pathlib import Path
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from tempfile import TemporaryDirectory
+
+import pymupdf4llm
+from chunks  import process_markdown_content
+from sqlalchemy import text
+
+from database import insert_document_chunks
+from embeddings import generate_embeddings
 
 
-# ==========================================
-# 1. LOAD ENVIRONMENT VARIABLES
-# ==========================================
+# =====================================
+# 1. FETCH DOCUMENTS FROM DATABASE
+# =====================================
 
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-AWS_REGION = os.getenv("AWS_REGION")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-
-
-# ==========================================
-# 2. SQLALCHEMY DATABASE CONNECTION
-# ==========================================
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True
-)
-
-
-# ==========================================
-# 3. AWS S3 CLIENT
-# ==========================================
-
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
-
-
-# ==========================================
-# 4. FETCH PDF PATH FROM NEON DB
-# ==========================================
-
-def fetch_pdf_documents():
+def fetch_pdf_documents(engine):
 
     query = text("""
         SELECT
+            document_id,
             document_name,
             file_name,
             bucket_name,
@@ -70,10 +38,11 @@ def fetch_pdf_documents():
     return documents
 
 
-# ==========================================
-# 5. DOWNLOAD PDF FROM S3
-# ==========================================
-def download_pdf(bucket_name, s3_key, local_path):
+# =====================================
+# 2. DOWNLOAD PDF FROM S3
+# =====================================
+
+def download_pdf(s3_client, bucket_name, s3_key, local_path):
 
     s3_client.download_file(
         bucket_name,
@@ -81,12 +50,10 @@ def download_pdf(bucket_name, s3_key, local_path):
         str(local_path)
     )
 
-    print(f"PDF downloaded temporarily: {local_path}")
 
-
-# ==========================================
-# 6. EXTRACT PDF CONTENT AS MARKDOWN
-# ==========================================
+# =====================================
+# 3. EXTRACT PDF AS MARKDOWN
+# =====================================
 
 def extract_markdown(pdf_path):
 
@@ -94,15 +61,15 @@ def extract_markdown(pdf_path):
         str(pdf_path),
         table_strategy="lines",
         page_chunks=False,
-        show_progress=False
+        show_progress=True
     )
 
     return markdown_content
 
 
-# ==========================================
-# 7. SAVE MARKDOWN FILE
-# ==========================================
+# =====================================
+# 4. SAVE MARKDOWN FILE
+# =====================================
 
 def save_markdown(markdown_content, markdown_path):
 
@@ -110,29 +77,26 @@ def save_markdown(markdown_content, markdown_path):
 
         file.write(markdown_content)
 
-    print(f"Markdown saved: {markdown_path}")
 
+# =====================================
+# 5. PROCESS ALL DOCUMENTS
+# =====================================
 
-# ==========================================
-# 8. MAIN EXECUTION
-# ==========================================
+def process_documents(engine, s3_client):
 
-
-from tempfile import TemporaryDirectory
-from pathlib import Path
-
-def main():
-
-    documents = fetch_pdf_documents()
+    documents = fetch_pdf_documents(engine)
 
     print(f"Total PDF documents: {len(documents)}")
 
-    # Permanent folder for Markdown files only
     output_folder = Path("output/markdown")
-    output_folder.mkdir(parents=True, exist_ok=True)
 
+    output_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+    all_chunks = []
     for document in documents:
-
+        document_id = document['document_id']
         document_name = document["document_name"]
         file_name = document["file_name"]
         bucket_name = document["bucket_name"]
@@ -142,56 +106,77 @@ def main():
 
         try:
 
-            # Create temporary directory
             with TemporaryDirectory() as temp_dir:
 
                 temp_dir = Path(temp_dir)
 
-                # PDF will be downloaded here temporarily
+                # Temporary PDF location
                 pdf_filename = Path(file_name).name
+
                 pdf_path = temp_dir / pdf_filename
 
-                # Download PDF from S3
+                # Download PDF
                 download_pdf(
+                    s3_client,
                     bucket_name,
                     s3_key,
                     pdf_path
                 )
 
-                # Extract PDF content
+                print("PDF downloaded successfully")
+
+                # Extract Markdown
                 markdown_content = extract_markdown(pdf_path)
 
                 if not markdown_content.strip():
+
                     print("No content extracted!")
                     continue
 
-                # Create Markdown file
+                # Markdown output path
                 markdown_filename = (
                     Path(file_name).stem + ".md"
                 )
 
-                markdown_path = output_folder / markdown_filename
+                markdown_path = (
+                    output_folder / markdown_filename
+                )
 
-                # Save only Markdown permanently
+                # Save Markdown
                 save_markdown(
                     markdown_content,
                     markdown_path
                 )
+                chunks = process_markdown_content(
+                    markdown_content=markdown_content,
+                    document_name=Path(file_name).stem
+                )
+                all_chunks.extend(chunks)
 
-            # Temporary PDF is automatically deleted
+                embeddings = generate_embeddings(chunks)
+
+                insert_document_chunks(
+
+                    engine=engine,
+
+                    document_id=document_id,
+
+                    chunks=chunks,
+
+                    embeddings=embeddings
+                    )
+
+                print(
+                    f"Successfully created {len(chunks)} chunks "
+                    f"for {document_name}"
+                )
 
             print(f"Successfully processed: {document_name}")
-
         except Exception as error:
 
-            print(f"Error processing {document_name}: {error}")
+            print(
+                f"Error processing {document_name}: {error}"
+            )
+    print(f"\nTotal chunks generated: {len(all_chunks)}")
 
-
-
-if __name__ == "__main__":
-
-    try:
-        main()
-
-    finally:
-        engine.dispose()
+    return all_chunks
