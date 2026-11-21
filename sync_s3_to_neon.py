@@ -16,6 +16,9 @@ load_dotenv()
 BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 AWS_REGION = os.getenv("AWS_REGION")
 DATABASE_URL = os.getenv("DATABASE_URL")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
 
 if not BUCKET_NAME or not DATABASE_URL:
     raise ValueError(
@@ -28,6 +31,8 @@ if not BUCKET_NAME or not DATABASE_URL:
 
 s3 = boto3.client(
     "s3",
+    aws_access_key_id= AWS_ACCESS_KEY,
+    aws_secret_access_key = AWS_SECRET_ACCESS_KEY,
     region_name=AWS_REGION
 )
 
@@ -44,11 +49,14 @@ cursor = conn.cursor()
 
 paginator = s3.get_paginator("list_objects_v2")
 
+print(paginator)
+
 total_pdfs = 0
 
 print("Scanning S3 bucket...")
 
 for page in paginator.paginate(Bucket=BUCKET_NAME):
+    print(page)
 
     for obj in page.get("Contents", []):
 

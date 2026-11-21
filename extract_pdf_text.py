@@ -1,153 +1,197 @@
 
 import os
 import boto3
-import fitz  # PyMuPDF
+import pymupdf4llm
 
+from pathlib import Path
 from dotenv import load_dotenv
-from pathlib import PurePosixPath
+from sqlalchemy import create_engine, text
 
-# Load environment variables
+
+# ==========================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# ==========================================
+
 load_dotenv()
 
-# -----------------------------------------
-# CONFIGURATION
-# -----------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 AWS_REGION = os.getenv("AWS_REGION")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-if not BUCKET_NAME:
-    raise ValueError("S3_BUCKET_NAME is missing in .env")
 
-# -----------------------------------------
-# S3 CONNECTION
-# -----------------------------------------
+# ==========================================
+# 2. SQLALCHEMY DATABASE CONNECTION
+# ==========================================
 
-s3 = boto3.client(
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True
+)
+
+
+# ==========================================
+# 3. AWS S3 CLIENT
+# ==========================================
+
+s3_client = boto3.client(
     "s3",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     region_name=AWS_REGION
 )
 
-# -----------------------------------------
-# OUTPUT FOLDER
-# -----------------------------------------
 
-OUTPUT_FOLDER = "extracted_markdown"
+# ==========================================
+# 4. FETCH PDF PATH FROM NEON DB
+# ==========================================
 
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+def fetch_pdf_documents():
 
-# -----------------------------------------
-# PDF TO MARKDOWN EXTRACTION
-# -----------------------------------------
+    query = text("""
+        SELECT
+            document_name,
+            file_name,
+            bucket_name,
+            s3_key
+        FROM hr_documents
+    """)
 
-def extract_pdf_to_markdown(pdf_bytes, document_name):
+    with engine.connect() as connection:
 
-    pdf_document = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
+        result = connection.execute(query)
+
+        documents = [
+            dict(row._mapping)
+            for row in result
+        ]
+
+    return documents
+
+
+# ==========================================
+# 5. DOWNLOAD PDF FROM S3
+# ==========================================
+def download_pdf(bucket_name, s3_key, local_path):
+
+    s3_client.download_file(
+        bucket_name,
+        s3_key,
+        str(local_path)
     )
 
-    markdown_content = []
+    print(f"PDF downloaded temporarily: {local_path}")
 
-    # Document title
-    markdown_content.append(f"# {document_name}\n")
 
-    markdown_content.append(
-        "> Source: HR Policy Document\n"
+# ==========================================
+# 6. EXTRACT PDF CONTENT AS MARKDOWN
+# ==========================================
+
+def extract_markdown(pdf_path):
+
+    markdown_content = pymupdf4llm.to_markdown(
+        str(pdf_path),
+        table_strategy="lines",
+        page_chunks=False,
+        show_progress=False
     )
 
-    # Extract text page by page
-    for page_number, page in enumerate(pdf_document, start=1):
-
-        text = page.get_text("text").strip()
-
-        if not text:
-            text = "*No extractable text found on this page.*"
-
-        markdown_content.append(
-            f"\n---\n\n## Page {page_number}\n\n{text}\n"
-        )
-
-    pdf_document.close()
-
-    return "\n".join(markdown_content)
+    return markdown_content
 
 
-# -----------------------------------------
-# FETCH PDFs FROM S3
-# -----------------------------------------
+# ==========================================
+# 7. SAVE MARKDOWN FILE
+# ==========================================
 
-paginator = s3.get_paginator("list_objects_v2")
+def save_markdown(markdown_content, markdown_path):
 
-total_pdfs = 0
+    with open(markdown_path, "w", encoding="utf-8") as file:
 
-print("Starting PDF to Markdown extraction...")
+        file.write(markdown_content)
 
-for page in paginator.paginate(Bucket=BUCKET_NAME):
+    print(f"Markdown saved: {markdown_path}")
 
-    for obj in page.get("Contents", []):
 
-        s3_key = obj["Key"]
+# ==========================================
+# 8. MAIN EXECUTION
+# ==========================================
 
-        # Process only PDF files
-        if not s3_key.lower().endswith(".pdf"):
-            continue
 
-        file_name = PurePosixPath(s3_key).name
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
-        document_name = PurePosixPath(s3_key).stem.replace("_", " ")
+def main():
 
-        print(f"\nProcessing: {file_name}")
+    documents = fetch_pdf_documents()
+
+    print(f"Total PDF documents: {len(documents)}")
+
+    # Permanent folder for Markdown files only
+    output_folder = Path("output/markdown")
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    for document in documents:
+
+        document_name = document["document_name"]
+        file_name = document["file_name"]
+        bucket_name = document["bucket_name"]
+        s3_key = document["s3_key"]
+
+        print(f"\nProcessing: {document_name}")
 
         try:
 
-            # Download PDF into memory
-            response = s3.get_object(
-                Bucket=BUCKET_NAME,
-                Key=s3_key
-            )
+            # Create temporary directory
+            with TemporaryDirectory() as temp_dir:
 
-            pdf_bytes = response["Body"].read()
+                temp_dir = Path(temp_dir)
 
-            # Extract Markdown
-            markdown_text = extract_pdf_to_markdown(
-                pdf_bytes,
-                document_name
-            )
+                # PDF will be downloaded here temporarily
+                pdf_filename = Path(file_name).name
+                pdf_path = temp_dir / pdf_filename
 
-            # Save as Markdown file
-            output_file = (
-                PurePosixPath(s3_key).stem + ".md"
-            )
+                # Download PDF from S3
+                download_pdf(
+                    bucket_name,
+                    s3_key,
+                    pdf_path
+                )
 
-            output_path = os.path.join(
-                OUTPUT_FOLDER,
-                output_file
-            )
+                # Extract PDF content
+                markdown_content = extract_markdown(pdf_path)
 
-            with open(
-                output_path,
-                "w",
-                encoding="utf-8"
-            ) as file:
+                if not markdown_content.strip():
+                    print("No content extracted!")
+                    continue
 
-                file.write(markdown_text)
+                # Create Markdown file
+                markdown_filename = (
+                    Path(file_name).stem + ".md"
+                )
 
-            total_pdfs += 1
+                markdown_path = output_folder / markdown_filename
 
-            print(f"Successfully extracted: {output_file}")
+                # Save only Markdown permanently
+                save_markdown(
+                    markdown_content,
+                    markdown_path
+                )
 
-        except Exception as e:
+            # Temporary PDF is automatically deleted
 
-            print(f"Failed to process {file_name}: {e}")
+            print(f"Successfully processed: {document_name}")
+
+        except Exception as error:
+
+            print(f"Error processing {document_name}: {error}")
 
 
-# -----------------------------------------
-# COMPLETION
-# -----------------------------------------
 
-print("\n----------------------------------")
-print("Markdown extraction completed!")
-print(f"Total PDFs processed: {total_pdfs}")
-print(f"Output folder: {OUTPUT_FOLDER}")
-print("----------------------------------")
+if __name__ == "__main__":
+
+    try:
+        main()
+
+    finally:
+        engine.dispose()

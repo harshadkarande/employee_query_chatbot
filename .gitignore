@@ -1,3 +1,5 @@
 .env
 extracted_markdown/
 extracted_text/
+output/
+
